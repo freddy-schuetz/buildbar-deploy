@@ -133,8 +133,10 @@ app.post('/prepare', gate, async (req, res) => {
 // 2) App anlegen (oder redeploy) + Env + Build
 app.post('/publish', gate, async (req, res) => {
   const deployId = String((req.body && req.body.deployId) || '').trim();
-  let baseDir = String((req.body && req.body.base_dir) || '').trim() || '/';
-  if (baseDir[0] !== '/') baseDir = '/' + baseDir;
+  // Coolify: Wurzel = leerer String (nicht "/"); Subdir = "/name".
+  let baseDir = String((req.body && req.body.base_dir) || '').trim();
+  if (baseDir === '/') baseDir = '';
+  else if (baseDir && baseDir[0] !== '/') baseDir = '/' + baseDir;
   const rec = store.get(deployId);
   if (!rec) return res.status(404).json({ error: 'unbekannte deployId (erst /prepare aufrufen)' });
   try {
