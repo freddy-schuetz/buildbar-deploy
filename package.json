@@ -1,0 +1,9 @@
+{
+  "name": "buildbar-deploy",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Isolierter Desktop-Deploy-Dienst fuer buildbar (privates Repo -> Coolify-App). Faengt mcp-hub nicht an.",
+  "main": "server.js",
+  "scripts": { "start": "node server.js" },
+  "dependencies": { "express": "^4.19.2" }
+}
