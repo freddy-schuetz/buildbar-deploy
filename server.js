@@ -72,7 +72,8 @@ function limited(ip) {
   const now = Date.now();
   const e = hits.get(ip);
   const w = e && now - e.t < 5 * 60000;
-  if (w && e.n >= 10) return true;
+  // Grosszuegig: beim Event sitzen alle hinter derselben IP (Hot-Patch vom 01.09. nach git uebernommen)
+  if (w && e.n >= 300) return true;
   hits.set(ip, { n: (w ? e.n : 0) + 1, t: w ? e.t : now });
   return false;
 }
@@ -139,6 +140,7 @@ app.post('/publish', gate, async (req, res) => {
   else if (baseDir && baseDir[0] !== '/') baseDir = '/' + baseDir;
   const rec = store.get(deployId);
   if (!rec) return res.status(404).json({ error: 'unbekannte deployId (erst /prepare aufrufen)' });
+  let envFailed = [];
   try {
     if (!rec.appUuid) {
       const sub = 'app-' + deployId.slice(0, 8);
@@ -169,25 +171,40 @@ app.post('/publish', gate, async (req, res) => {
         method: 'PATCH',
         body: JSON.stringify({ domains: domain }),
       });
+      // ENV per Bulk-Upsert setzen. Frueher: Einzel-POST mit is_build_time -> Coolify 4.3.10
+      // antwortete 422, der Fehler wurde verschluckt und jede Variable ging lautlos verloren.
+      // Ohne das Feld gilt die Variable fuer Build UND Laufzeit.
       const envRaw = String((req.body && req.body.env) || '');
+      const envData = [];
       for (const line of envRaw.split(/\r?\n/)) {
         const i = line.indexOf('=');
         if (i < 1) continue;
         const k = line.slice(0, i).trim();
         const v = line.slice(i + 1).trim();
         if (!k) continue;
+        envData.push({ key: k, value: v, is_preview: false });
+      }
+      if (envData.length) {
         try {
-          await cf('/applications/' + rec.appUuid + '/envs', {
-            method: 'POST',
-            body: JSON.stringify({ key: k, value: v, is_preview: false, is_build_time: true }),
+          const er = await cf('/applications/' + rec.appUuid + '/envs/bulk', {
+            method: 'PATCH',
+            body: JSON.stringify({ data: envData }),
           });
-        } catch (e) {}
+          if (!er.ok) envFailed = envData.map((d) => d.key + ' (HTTP ' + er.status + ')');
+        } catch (e) {
+          envFailed = envData.map((d) => d.key);
+        }
       }
       store.set(deployId, rec);
       persist();
     }
     await cf('/deploy?uuid=' + rec.appUuid + '&force=false', { method: 'POST' });
-    res.json({ url: rec.appDomain, app: rec.appUuid, status: 'deploying', hint: 'Erster Build dauert einige Minuten.' });
+    const out = { url: rec.appDomain, app: rec.appUuid, status: 'deploying', hint: 'Erster Build dauert einige Minuten.' };
+    if (envFailed.length) {
+      out.env_failed = envFailed;
+      out.warning = 'Diese Umgebungsvariablen konnten nicht gesetzt werden. Die App startet ohne sie.';
+    }
+    res.json(out);
   } catch (e) {
     res.status(500).json({ error: String((e && e.message) || e) });
   }
