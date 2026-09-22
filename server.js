@@ -17,6 +17,9 @@
 //           damit Aenderungen auch in einer neuen Sitzung ohne deployId rausgehen.
 //           Optional liefern /publish und /update die fertige Zeile, mit der ein
 //           GitHub-Webhook eingerichtet wird: danach veroeffentlicht jeder Push selbst.
+//   4) POST /status {repo | deployId, password}
+//        -> Ausgang des letzten Builds samt Fehlerzeilen. Ohne das raet der Assistent
+//           bei einem 503 ins Blaue, denn das Protokoll liegt nur in Coolify.
 //
 // Der Coolify-API-Token bleibt ENV dieses Dienstes; Private Keys verlassen ihn nie.
 // Dieser Dienst fasst weder mcp-hub noch andere Dienste an.
@@ -131,7 +134,7 @@ app.use(express.json({ limit: '64kb' }));
 
 app.get('/healthz', (req, res) => res.type('text').send('ok'));
 app.get('/', (req, res) =>
-  res.type('text').send('buildbar-deploy: POST /prepare, dann /publish. Aenderungen: POST /update {repo, password}. Event-Passwort noetig.'));
+  res.type('text').send('buildbar-deploy: POST /prepare, dann /publish. Aenderungen: POST /update {repo, password}. Ausgang: POST /status. Event-Passwort noetig.'));
 
 function gate(req, res, next) {
   if (limited(clientIp(req))) return res.status(429).json({ error: 'zu viele Versuche' });
@@ -253,15 +256,68 @@ app.post('/publish', gate, async (req, res) => {
       store.set(deployId, rec);
       persist();
     }
-    await cf('/deploy?uuid=' + rec.appUuid + '&force=false', { method: 'POST' });
+    await deployAnstossen(rec, deployId);
     const out = { url: rec.appDomain, app: rec.appUuid, deployId, status: 'deploying', hint: 'Erster Build dauert einige Minuten.' };
-    out.update = 'Spaetere Aenderungen: erst pushen, dann POST /update {repo, password}. Die Adresse bleibt dieselbe.';
+    out.update = 'Spaetere Aenderungen: erst pushen, dann POST /update {repo, password}. Die Adresse bleibt dieselbe. '
+      + 'Ging etwas schief: POST /status {repo, password} zeigt Ausgang und Fehlerzeilen des letzten Builds.';
     out.webhook = await webhookInfo(rec);
     if (envFailed.length) {
       out.env_failed = envFailed;
       out.warning = 'Diese Umgebungsvariablen konnten nicht gesetzt werden. Die App startet ohne sie.';
     }
     res.json(out);
+  } catch (e) {
+    res.status(500).json({ error: String((e && e.message) || e) });
+  }
+});
+
+// Merkt sich den zuletzt angestossenen Build, damit /status ihn nachschlagen kann.
+async function deployAnstossen(rec, deployId) {
+  const dr = await cf('/deploy?uuid=' + rec.appUuid + '&force=false', { method: 'POST' });
+  const dj = await dr.json().catch(() => ({}));
+  const du = dj && dj.deployments && dj.deployments[0] && dj.deployments[0].deployment_uuid;
+  if (du) {
+    rec.lastDeployment = du;
+    store.set(deployId, rec);
+    persist();
+  }
+  return { ok: dr.ok, status: dr.status, deploymentUuid: du || null };
+}
+
+// 4) Wie ist der letzte Build ausgegangen? Ohne diese Auskunft raet der Assistent
+// bei einem 503 ins Blaue - das Protokoll liegt sonst nur in Coolify.
+app.post('/status', gate, async (req, res) => {
+  const deployId = String((req.body && req.body.deployId) || '').trim();
+  const repo = String((req.body && req.body.repo) || '').trim();
+  let rec = deployId ? store.get(deployId) : null;
+  if (!rec || !rec.appUuid) {
+    const treffer = repoOk(repo) ? findByRepo(repo) : null;
+    if (!treffer) return res.status(404).json({ error: 'Keine Veroeffentlichung zu repo/deployId gefunden.' });
+    rec = treffer.rec;
+  }
+  if (!rec.lastDeployment) {
+    return res.json({ url: rec.appDomain, app: rec.appUuid, status: 'unbekannt',
+      hinweis: 'Zu dieser App ist hier kein Build vermerkt. Nach dem naechsten /update steht er hier.' });
+  }
+  try {
+    const r = await cf('/deployments/' + rec.lastDeployment);
+    const j = await r.json().catch(() => ({}));
+    let zeilen = [];
+    try {
+      zeilen = JSON.parse(j.logs || '[]')
+        .map((e) => String(e.output || '').replace(/\s+$/, ''))
+        .filter(Boolean);
+    } catch (e) { zeilen = []; }
+    const fehler = zeilen.filter((z) => /error|failed|not a directory|exit code/i.test(z)).slice(-8);
+    res.json({
+      url: rec.appDomain,
+      app: rec.appUuid,
+      status: j.status || 'unbekannt',
+      commit: (j.commit || '').slice(0, 7),
+      fertig: j.finished_at || null,
+      fehlerzeilen: fehler.map((z) => z.slice(0, 300)),
+      letzte_zeilen: zeilen.slice(-20).map((z) => z.slice(0, 300)),
+    });
   } catch (e) {
     res.status(500).json({ error: String((e && e.message) || e) });
   }
@@ -289,9 +345,9 @@ app.post('/update', gate, async (req, res) => {
     rec = treffer.rec;
   }
   try {
-    const dr = await cf('/deploy?uuid=' + rec.appUuid + '&force=false', { method: 'POST' });
-    if (!dr.ok) {
-      return res.status(502).json({ error: 'Coolify hat den Build abgelehnt (HTTP ' + dr.status + ')' });
+    const an = await deployAnstossen(rec, id);
+    if (!an.ok) {
+      return res.status(502).json({ error: 'Coolify hat den Build abgelehnt (HTTP ' + an.status + ')' });
     }
     res.json({
       url: rec.appDomain,
