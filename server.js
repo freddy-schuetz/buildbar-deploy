@@ -308,7 +308,12 @@ app.post('/status', gate, async (req, res) => {
         .map((e) => String(e.output || '').replace(/\s+$/, ''))
         .filter(Boolean);
     } catch (e) { zeilen = []; }
-    const fehler = zeilen.filter((z) => /error|failed|not a directory|exit code/i.test(z)).slice(-8);
+    // Nur bei echtem Fehlschlag: auch erfolgreiche Builds enthalten harmlose Zeilen
+    // wie "No such container" aus dem Aufraeumen, die sonst falschen Alarm ausloesen.
+    const fehler =
+      j.status === 'failed'
+        ? zeilen.filter((z) => /error|failed|not a directory|exit code/i.test(z)).slice(-8)
+        : [];
     res.json({
       url: rec.appDomain,
       app: rec.appUuid,
